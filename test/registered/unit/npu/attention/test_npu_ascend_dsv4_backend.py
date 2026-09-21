@@ -85,6 +85,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -1219,6 +1220,157 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
         custom_ops.indexer_compress_epilog.assert_not_called()
+
+
+class TestNPURequestStateClear(unittest.TestCase):
+    @staticmethod
+    def _pool(*, ring_size=128, width=128, device="cpu", fused=True):
+        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        pool._fused_request_state_clear = fused
+        # Four request banks, then a guard/dummy row. PP gaps and page-scoped
+        # C4 state must not appear in the reset kernel's pointer table.
+        pools = [
+            SimpleNamespace(
+                ratio=128 if request_scoped else 4,
+                request_scoped=request_scoped,
+                online=False,
+                ring_size=ring_size,
+                kv_score_buffer=KVAndScore(
+                    torch.full(
+                        (4 * ring_size + 1, width),
+                        float(i + 3),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                ),
+            )
+            for i, request_scoped in enumerate([True, False, True, True])
+        ]
+        pool.compress_state_pools = [None, *pools, None]
+        return pool, pools
+
+    def test_pointer_table_is_built_once_and_only_contains_request_state(self):
+        pool, pools = self._pool()
+        with patch(
+            "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.clear_dsv4_request_state"
+        ) as clear:
+            pool._init_request_state_clear()
+            ptrs, ring_size, width = pool._request_state_clear_args
+            self.assertEqual(
+                ptrs.tolist(),
+                [
+                    p.kv_score_buffer.kv_score.data_ptr()
+                    for p in pools
+                    if p.request_scoped
+                ],
+            )
+            self.assertEqual((ring_size, width), (128, 128))
+            clear.assert_called_once_with(ptrs, 0, ring_size, width)
+            # Warmup is on unallocated bank 0. Repeated resets reuse the table
+            # and do not create or copy a new device tensor per request.
+            with patch("torch.tensor", side_effect=AssertionError("unexpected H2D")):
+                pool.clear_request_scoped_state(3)
+                pool.clear_request_scoped_state(1)
+            self.assertIs(pool._request_state_clear_args[0], ptrs)
+            self.assertEqual([c.args[1] for c in clear.call_args_list], [0, 3, 1])
+
+    def test_stage_without_request_state_is_a_noop(self):
+        pool, pools = self._pool()
+        pool.compress_state_pools = [None, pools[1], None]
+        with patch(
+            "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.clear_dsv4_request_state"
+        ) as clear:
+            pool._init_request_state_clear()
+            pool.clear_request_scoped_state(1)
+        clear.assert_not_called()
+        self.assertIsNone(pool._request_state_clear_args)
+
+    def test_rejects_incompatible_state_layout(self):
+        for invalid in ("online", "ring", "dtype", "strided"):
+            with self.subTest(invalid=invalid):
+                pool, pools = self._pool()
+                p = pools[-1]
+                if invalid == "online":
+                    p.online = True
+                elif invalid == "ring":
+                    p.ring_size *= 2
+                elif invalid == "dtype":
+                    p.kv_score_buffer.kv_score = p.kv_score_buffer.kv_score.half()
+                else:
+                    p.kv_score_buffer.kv_score = p.kv_score_buffer.kv_score[:, ::2]
+                with self.assertRaises(AssertionError):
+                    pool._init_request_state_clear()
+
+    @patch("sglang.srt.mem_cache.deepseek_v4_memory_pool.ONLINE_C128", False)
+    def test_disabled_path_keeps_original_reset_and_slot_is_reusable(self):
+        pool, pools = self._pool(fused=False)
+        pool._init_request_state_clear()
+        self.assertIsNone(pool._request_state_clear_args)
+        before = [p.kv_score_buffer.kv_score.clone() for p in pools]
+        pool.clear_request_scoped_state(3)
+        self._assert_matches_reference(pools, before, [3])
+        for p in pools:
+            if p.request_scoped:
+                p.kv_score_buffer.kv_score[3 * 128 : 4 * 128].fill_(9)
+        pool.clear_request_scoped_state(3)
+        self._assert_matches_reference(pools, before, [3])
+
+    def _assert_matches_reference(self, pools, before, req_indices):
+        for p, expected in zip(pools, before):
+            expected = expected.clone()
+            if p.request_scoped:
+                for req_idx in req_indices:
+                    rows = expected[req_idx * p.ring_size : (req_idx + 1) * p.ring_size]
+                    half = rows.shape[-1] // 2
+                    rows[:, :half] = 0
+                    rows[:, half:] = -float("inf")
+            torch.testing.assert_close(
+                p.kv_score_buffer.kv_score.cpu(), expected.cpu(), rtol=0, atol=0
+            )
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
+    )
+    def test_npu_reset_matches_reference_and_preserves_other_banks(self):
+        for ring_size in (128, 256):
+            # 1030 exercises the last partially filled tile and row modulo.
+            for width in (128, 1024, 1030):
+                with self.subTest(ring_size=ring_size, width=width):
+                    pool, pools = self._pool(
+                        ring_size=ring_size, width=width, device="npu"
+                    )
+                    before = [p.kv_score_buffer.kv_score.cpu().clone() for p in pools]
+                    pool._init_request_state_clear()
+                    pool.clear_request_scoped_state(3)
+                    pool.clear_request_scoped_state(1)
+                    self._assert_matches_reference(pools, before, [0, 3, 1])
+                    for p in pools:
+                        if p.request_scoped:
+                            p.kv_score_buffer.kv_score[ring_size : 2 * ring_size].fill_(
+                                17
+                            )
+                    pool.clear_request_scoped_state(1)
+                    self._assert_matches_reference(pools, before, [0, 3, 1])
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
+    )
+    def test_npu_reset_obeys_current_stream_dependencies(self):
+        pool, pools = self._pool(device="npu")
+        pool._init_request_state_clear()
+        before = [p.kv_score_buffer.kv_score.cpu().clone() for p in pools]
+        forward = torch.npu.Stream()
+        schedule = torch.npu.Stream()
+        forward.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(forward):
+            for p in pools:
+                if p.request_scoped:
+                    p.kv_score_buffer.kv_score[128:256].fill_(17)
+        schedule.wait_stream(forward)
+        with torch.npu.stream(schedule):
+            pool.clear_request_scoped_state(1)
+        torch.npu.current_stream().wait_stream(schedule)
+        self._assert_matches_reference(pools, before, [1])
 
 
 if __name__ == "__main__":

@@ -22,7 +22,9 @@ import torch
 import torch_npu
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.memory.clear_dsv4_state import clear_dsv4_request_state
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -280,6 +282,59 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         self.c128_page_size = c128_page_size
         super().__init__(*args, **kwargs)
+        self._fused_request_state_clear = envs.SGLANG_NPU_DSV4_FUSED_STATE_CLEAR.get()
+        self._init_request_state_clear()
+
+    def _init_request_state_clear(self) -> None:
+        self._request_state_clear_args = None
+        if not self._fused_request_state_clear:
+            return
+
+        pools = [
+            pool
+            for pool in self.compress_state_pools
+            if pool is not None and pool.request_scoped
+        ]
+        if not pools:
+            return
+
+        ring_size = pools[0].ring_size
+        buffers = [pool.kv_score_buffer.kv_score for pool in pools]
+        width = buffers[0].shape[-1]
+        assert ring_size > 0 and width > 0 and width % 2 == 0
+        assert all(
+            not pool.online
+            and pool.ring_size == ring_size
+            and buf.ndim == 2
+            and buf.shape[-1] == width
+            and buf.dtype == torch.float32
+            and buf.device == buffers[0].device
+            and buf.is_contiguous()
+            for pool, buf in zip(pools, buffers)
+        ), "NPU request state reset requires a shared non-online FP32 ring layout"
+        self._request_state_clear_args = (
+            torch.tensor(
+                [buf.data_ptr() for buf in buffers],
+                dtype=torch.int64,
+                device=buffers[0].device,
+            ),
+            ring_size,
+            width,
+        )
+        # All banks are still unallocated during construction. Warm the kernel
+        # on bank 0 so the first completed request does not pay JIT compilation.
+        self.clear_request_scoped_state(0)
+
+    def clear_request_scoped_state(self, req_pool_idx: int) -> None:
+        if not self._fused_request_state_clear:
+            return super().clear_request_scoped_state(req_pool_idx)
+        if self._request_state_clear_args is None:
+            return
+        ptrs, ring_size, width = self._request_state_clear_args
+        # Keep the allocator's original call site and current-stream ordering:
+        # shared readers precede this reset, and slot reuse follows it. Only
+        # per-layer launches are fused; no frees or resets are deferred.
+        clear_dsv4_request_state(ptrs, int(req_pool_idx), ring_size, width)
 
     def _make_kv_pool(
         self,
