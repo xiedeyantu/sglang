@@ -88,7 +88,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.q_a_layernorm = q_a_layernorm
         self.kv_a_layernorm = kv_a_layernorm
         self.q_b_proj = q_b_proj
-        self.w_kc = w_kc.contiguous()
+        # The decode MLAProlog path releases the caller's w_kc storage.
+        # Keep an independent copy even when that weight is already contiguous.
+        self.w_kc = w_kc.clone(memory_format=torch.contiguous_format)
         self.rotary_emb = rotary_emb
         self.layer_id = layer_id
         self.quant_config = quant_config

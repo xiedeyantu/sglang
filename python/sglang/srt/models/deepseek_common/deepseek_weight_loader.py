@@ -749,9 +749,15 @@ class DeepseekV2WeightLoaderMixin:
                 )
 
             if not use_deep_gemm_bmm:
-                self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                )
+                if _is_npu:
+                    # CANN consumes [heads, qk_nope_head_dim, kv_lora_rank].
+                    # Store this layout once to avoid a weight transpose on
+                    # every Q absorption BMM. Own the storage even with one
+                    # head, since MLA preprocessing may release it later.
+                    w_kc = w_kc.clone(memory_format=torch.contiguous_format)
+                else:
+                    w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_kc = bind_or_assign(self_attn.w_kc, w_kc)
                 w_vc = w_vc.contiguous().transpose(1, 2)
                 if _is_npu:
                     w_vc = w_vc.contiguous()

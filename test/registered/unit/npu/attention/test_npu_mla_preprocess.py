@@ -4,21 +4,57 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.mla_preprocess.
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
 
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+    NPUFusedMLAPreprocess,
     is_fia_nz,
     is_mla_preprocess_enabled,
     round_up,
     trans_rope_weight,
     transdata,
 )
+
+
+class TestNPUFusedMLAPreprocess(CustomTestCase):
+    def test_weight_survives_parent_storage_release(self):
+        """Decode MLAProlog frees the parent weight after preparing its copy."""
+        for contiguous in (False, True):
+            with self.subTest(contiguous=contiguous):
+                weight = torch.randn(2, 128, 512, dtype=torch.bfloat16)
+                if not contiguous:
+                    weight = weight.transpose(1, 2).contiguous().transpose(1, 2)
+                expected = weight.clone()
+                with patch(
+                    "sglang.srt.hardware_backend.npu.attention."
+                    "mla_preprocess.is_npu_arch35",
+                    return_value=False,
+                ):
+                    preprocess = NPUFusedMLAPreprocess(
+                        fused_qkv_a_proj_with_mqa=None,
+                        q_a_layernorm=None,
+                        kv_a_layernorm=SimpleNamespace(hidden_size=512),
+                        q_b_proj=SimpleNamespace(input_size=1536),
+                        w_kc=weight,
+                        rotary_emb=None,
+                        layer_id=0,
+                        num_local_heads=2,
+                        qk_nope_head_dim=128,
+                        qk_rope_head_dim=64,
+                        v_head_dim=128,
+                    )
+                self.assertNotEqual(preprocess.w_kc.data_ptr(), weight.data_ptr())
+                weight.untyped_storage().resize_(0)
+                self.assertTrue(preprocess.w_kc.is_contiguous())
+                torch.testing.assert_close(preprocess.w_kc, expected, rtol=0, atol=0)
 
 
 class TestRoundUp(unittest.TestCase):
